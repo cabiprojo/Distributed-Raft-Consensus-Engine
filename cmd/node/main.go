@@ -2,11 +2,14 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"net"
+	"strings"
 
 	"google.golang.org/grpc"
+
+	"raft-kv/internal/raft"
+	pb "raft-kv/proto"
 )
 
 func main() {
@@ -19,7 +22,10 @@ func main() {
 		log.Fatal("must provide -id and -port")
 	}
 
-	fmt.Printf("starting node %s on port %s, peers=%s\n", *id, *port, *peers)
+	var peerList []string
+	if *peers != "" {
+		peerList = strings.Split(*peers, ",")
+	}
 
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
@@ -28,9 +34,9 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 
-	// TODO(you): once raft.proto is filled in and generated, register the
-	// RaftService server here, e.g.:
-	//   pb.RegisterRaftServiceServer(grpcServer, raftNode)
+	raftNode := raft.NewNode(*id, peerList)
+	pb.RegisterRaftServiceServer(grpcServer, raftNode)
+	raftNode.Start()
 
 	log.Printf("node %s listening on :%s", *id, *port)
 	if err := grpcServer.Serve(lis); err != nil {
