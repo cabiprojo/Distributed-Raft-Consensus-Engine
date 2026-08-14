@@ -1,11 +1,16 @@
 package raft
 
 import (
+	"context"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
 
 	pb "raft-kv/proto"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type NodeState int
@@ -62,5 +67,68 @@ func (n *Node) runElectionTimer() {
 }
 
 func (n *Node) startElection() {
-	// TODO: implement
+	n.mu.Lock()
+	n.currentTerm++
+	n.votedFor = n.id
+	n.state = Candidate
+	n.lastHeartbeat = time.Now()
+
+	term := n.currentTerm
+	candidateID := n.id
+	peers := n.peers
+
+	lastLogIndex := int64(len(n.log) - 1)
+	var lastLogTerm int64
+	if len(n.log) > 0 {
+		lastLogTerm = n.log[len(n.log)-1].Term
+	}
+	n.mu.Unlock()
+
+	log.Printf("[%s] starting election for term %d", n.id, term)
+
+	total := len(peers) + 1
+	votesNeeded := total/2 + 1
+	voteCh := make(chan bool, len(peers))
+
+	for _, peer := range peers {
+		go func(peer string) {
+			conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				voteCh <- false
+				return
+			}
+			defer conn.Close()
+
+			client := pb.NewRaftServiceClient(conn)
+			reply, err := client.RequestVote(context.Background(), &pb.RequestVoteArgs{
+				Term:         term,
+				CandidateId:  candidateID,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			})
+			if err != nil {
+				voteCh <- false
+				return
+			}
+			voteCh <- reply.VoteGranted
+		}(peer)
+	}
+
+	votes := 1 // vote for self
+	for range peers {
+		if <-voteCh {
+			votes++
+		}
+		if votes >= votesNeeded {
+			break
+		}
+	}
+
+	n.mu.Lock()
+	won := votes >= votesNeeded && n.state == Candidate && n.currentTerm == term
+	if won {
+		n.state = Leader
+		log.Printf("[%s] won election, becomes leader for term %d", n.id, term)
+	}
+	n.mu.Unlock()
 }
