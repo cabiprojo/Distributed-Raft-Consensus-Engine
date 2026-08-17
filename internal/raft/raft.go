@@ -43,8 +43,8 @@ func randomElectionTimeout() time.Duration {
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
-// NewNode constructs a Node in the Follower state, ready to be started.
-// peers is the list of other nodes' "host:port" addresses.
+// NewNode constructs a Node in the Follower state, ready to be started
+// peers is the list of other nodes' "host:port" addresses
 func NewNode(id string, peers []string) *Node {
 	return &Node{
 		id:            id,
@@ -54,8 +54,8 @@ func NewNode(id string, peers []string) *Node {
 	}
 }
 
-// Start begins the node's background election-timeout goroutine. Call this
-// once, after registering the Node with a gRPC server.
+// Start begins the node's background election-timeout goroutine
+// call this once, after registering the Node with a gRPC server
 func (n *Node) Start() {
 	go n.runElectionTimer()
 }
@@ -96,7 +96,7 @@ func (n *Node) startElection() {
 	candidateID := n.id
 	peers := n.peers
 
-	lastLogIndex := int64(len(n.log) - 1)
+	lastLogIndex := int64(len(n.log))
 	var lastLogTerm int64
 	if len(n.log) > 0 {
 		lastLogTerm = n.log[len(n.log)-1].Term
@@ -229,7 +229,7 @@ func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.R
 	canVote := n.votedFor == "" || n.votedFor == args.CandidateId
 
 	// candidate's log must be at least as up-to-date as ours
-	lastLogIndex := int64(len(n.log) - 1)
+	lastLogIndex := int64(len(n.log))
 	var lastLogTerm int64
 	if len(n.log) > 0 {
 		lastLogTerm = n.log[len(n.log)-1].Term
