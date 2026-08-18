@@ -174,6 +174,15 @@ func (n *Node) startElection() {
 // to maintain this node's leadership for the given term. It exits as soon
 // as this node is no longer the leader of that term.
 func (n *Node) runLeaderHeartbeats(term int64) {
+	n.mu.Lock()
+	n.nextIndex = make(map[string]int64)
+	n.matchIndex = make(map[string]int64)
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = int64(len(n.log)) + 1
+		n.matchIndex[peer] = 0
+	}
+	n.mu.Unlock()
+
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -188,33 +197,98 @@ func (n *Node) runLeaderHeartbeats(term int64) {
 		n.mu.Unlock()
 
 		for _, peer := range peers {
-			go func(peer string) {
-				conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
-				if err != nil {
-					return
-				}
-				defer conn.Close()
+			go n.replicateToPeer(term, id, peer)
+		}
+	}
+}
 
-				client := pb.NewRaftServiceClient(conn)
-				reply, err := client.AppendEntries(context.Background(), &pb.AppendEntriesArgs{
-					Term:     term,
-					LeaderId: id,
-				})
-				if err != nil {
-					return
-				}
+// replicateToPeer sends one AppendEntries RPC to a single peer, containing
+// whatever entries that peer is missing according to nextIndex, then
+// updates nextIndex/matchIndex based on the result.
+func (n *Node) replicateToPeer(term int64, id string, peer string) {
+	n.mu.Lock()
+	if n.state != Leader || n.currentTerm != term {
+		n.mu.Unlock()
+		return
+	}
+	nextIdx := n.nextIndex[peer]
+	prevLogIndex := nextIdx - 1
+	var prevLogTerm int64
+	if prevLogIndex > 0 && prevLogIndex <= int64(len(n.log)) {
+		prevLogTerm = n.log[prevLogIndex-1].Term
+	}
+	var entries []*pb.LogEntry
+	if nextIdx <= int64(len(n.log)) {
+		entries = n.log[nextIdx-1:]
+	}
+	leaderCommit := n.commitIndex
+	n.mu.Unlock()
 
-				if reply.Term > term {
-					n.mu.Lock()
-					if reply.Term > n.currentTerm {
-						n.currentTerm = reply.Term
-						n.votedFor = ""
-						n.state = Follower
-						log.Printf("[%s] stepping down: saw higher term %d in AppendEntries reply", n.id, reply.Term)
-					}
-					n.mu.Unlock()
-				}
-			}(peer)
+	conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewRaftServiceClient(conn)
+	reply, err := client.AppendEntries(context.Background(), &pb.AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: leaderCommit,
+	})
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if reply.Term > n.currentTerm {
+		n.currentTerm = reply.Term
+		n.votedFor = ""
+		n.state = Follower
+		log.Printf("[%s] stepping down: saw higher term %d in AppendEntries reply", n.id, reply.Term)
+		return
+	}
+
+	if n.state != Leader || n.currentTerm != term {
+		return
+	}
+
+	if reply.Success {
+		n.matchIndex[peer] = prevLogIndex + int64(len(entries))
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.advanceCommitIndexLocked(term)
+	} else if n.nextIndex[peer] > 1 {
+		n.nextIndex[peer]--
+	}
+}
+
+// advanceCommitIndexLocked checks whether commitIndex can move forward.
+// Per the Figure 8 safety rule, an entry can only be committed by direct
+// majority count if it was created during the leader's own current term;
+// older entries become committed indirectly once a current-term entry
+// past them commits. Caller must hold n.mu.
+func (n *Node) advanceCommitIndexLocked(term int64) {
+	for N := int64(len(n.log)); N > n.commitIndex; N-- {
+		if n.log[N-1].Term != term {
+			continue
+		}
+		count := 1 // the leader itself has it
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= N {
+				count++
+			}
+		}
+		total := len(n.peers) + 1
+		if count >= total/2+1 {
+			n.commitIndex = N
+			n.applyCommittedLocked()
+			log.Printf("[%s] commitIndex advanced to %d", n.id, N)
+			return
 		}
 	}
 }
@@ -271,20 +345,20 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		return &pb.AppendEntriesReply{Term: n.currentTerm, Success: false}, nil
 	}
 
+	// higher term means this node is behind. adopt it and step down to follower
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.votedFor = ""
 	}
 
-	// a candidate steps down on an EQUAL term too, not just a higher one -
+	// a candidate steps down on an EQUAL term too, not just a higher one
 	// this is what handles a candidate discovering a legitimate leader that
 	// already won the same term it's currently campaigning for
 	n.state = Follower
 	n.lastHeartbeat = time.Now()
 
-	// consistency check: PrevLogIndex 0 means "nothing should come before
-	// this" and always matches. otherwise we must already have an entry at
-	// PrevLogIndex whose term matches PrevLogTerm
+	// consistency check: PrevLogIndex 0 means "nothing should come before this" and always matches
+	// otherwise we must already have an entry at PrevLogIndex whose term matches PrevLogTerm
 	if args.PrevLogIndex > 0 {
 		if args.PrevLogIndex > int64(len(n.log)) || n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 			return &pb.AppendEntriesReply{Term: n.currentTerm, Success: false}, nil
@@ -293,7 +367,7 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 
 	// walk the incoming entries: the first one that's missing or conflicts
 	// with what we have is where we truncate (discarding it and everything
-	// after - those can only be leftovers from an old, uncommitted leader)
+	// after those can only be leftovers from an old, uncommitted leader)
 	// and append the leader's version from that point on
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + int64(i) + 1
@@ -304,6 +378,7 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		break
 	}
 
+	// update commitIndex and apply any newly committed entries to the kv state machine
 	if args.LeaderCommit > n.commitIndex {
 		lastNewIndex := args.PrevLogIndex + int64(len(args.Entries))
 		n.commitIndex = min(args.LeaderCommit, lastNewIndex)
@@ -313,8 +388,8 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 	return &pb.AppendEntriesReply{Term: n.currentTerm, Success: true}, nil
 }
 
-// applyCommittedLocked applies log entries between lastApplied and
-// commitIndex to the kv state machine. Caller must hold n.mu.
+// applyCommittedLocked applies log entries between lastApplied and commitIndex to the kv state machine
+// caller must hold n.mu
 func (n *Node) applyCommittedLocked() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
@@ -323,8 +398,8 @@ func (n *Node) applyCommittedLocked() {
 	}
 }
 
-// applyCommand parses and applies a single encoded command against kv.
-// Encoding is deliberately simple: "SET key value" or "DELETE key".
+// applyCommand parses and applies a single encoded command against kv
+// Encoding is deliberately simple: "SET key value" or "DELETE key"
 func applyCommand(kv map[string]string, command string) {
 	parts := strings.SplitN(command, " ", 3)
 	if len(parts) == 0 {
