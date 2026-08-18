@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,17 @@ type Node struct {
 	currentTerm int64
 	votedFor    string
 	log         []*pb.LogEntry
+
+	// volatile state on all servers
+	commitIndex int64
+	lastApplied int64
+
+	// volatile state on leaders only, reinitialized after each election
+	nextIndex  map[string]int64
+	matchIndex map[string]int64
+
+	// the actual replicated state machine - applied to as entries commit
+	kv map[string]string
 }
 
 func randomElectionTimeout() time.Duration {
@@ -51,6 +63,7 @@ func NewNode(id string, peers []string) *Node {
 		state:         Follower,
 		peers:         peers,
 		lastHeartbeat: time.Now(),
+		kv:            make(map[string]string),
 	}
 }
 
@@ -269,5 +282,62 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 	n.state = Follower
 	n.lastHeartbeat = time.Now()
 
+	// consistency check: PrevLogIndex 0 means "nothing should come before
+	// this" and always matches. otherwise we must already have an entry at
+	// PrevLogIndex whose term matches PrevLogTerm
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex > int64(len(n.log)) || n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+			return &pb.AppendEntriesReply{Term: n.currentTerm, Success: false}, nil
+		}
+	}
+
+	// walk the incoming entries: the first one that's missing or conflicts
+	// with what we have is where we truncate (discarding it and everything
+	// after - those can only be leftovers from an old, uncommitted leader)
+	// and append the leader's version from that point on
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + int64(i) + 1
+		if idx <= int64(len(n.log)) && n.log[idx-1].Term == entry.Term {
+			continue
+		}
+		n.log = append(n.log[:idx-1], args.Entries[i:]...)
+		break
+	}
+
+	if args.LeaderCommit > n.commitIndex {
+		lastNewIndex := args.PrevLogIndex + int64(len(args.Entries))
+		n.commitIndex = min(args.LeaderCommit, lastNewIndex)
+		n.applyCommittedLocked()
+	}
+
 	return &pb.AppendEntriesReply{Term: n.currentTerm, Success: true}, nil
+}
+
+// applyCommittedLocked applies log entries between lastApplied and
+// commitIndex to the kv state machine. Caller must hold n.mu.
+func (n *Node) applyCommittedLocked() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		entry := n.log[n.lastApplied-1]
+		applyCommand(n.kv, entry.Command)
+	}
+}
+
+// applyCommand parses and applies a single encoded command against kv.
+// Encoding is deliberately simple: "SET key value" or "DELETE key".
+func applyCommand(kv map[string]string, command string) {
+	parts := strings.SplitN(command, " ", 3)
+	if len(parts) == 0 {
+		return
+	}
+	switch parts[0] {
+	case "SET":
+		if len(parts) == 3 {
+			kv[parts[1]] = parts[2]
+		}
+	case "DELETE":
+		if len(parts) >= 2 {
+			delete(kv, parts[1])
+		}
+	}
 }
