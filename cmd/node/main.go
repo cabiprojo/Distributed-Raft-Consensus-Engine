@@ -36,6 +36,7 @@ func main() {
 
 	raftNode := raft.NewNode(*id, peerList)
 	pb.RegisterRaftServiceServer(grpcServer, raftNode)
+	pb.RegisterClientServiceServer(grpcServer, raftNode)
 	raftNode.Start()
 
 	log.Printf("node %s listening on :%s", *id, *port)

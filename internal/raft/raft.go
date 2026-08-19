@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand"
 	"strings"
@@ -26,6 +27,7 @@ const (
 // node holds all persistent and volatile state for a single Raft node
 type Node struct {
 	pb.UnimplementedRaftServiceServer // embed the unimplemented server for forward compatibility
+	pb.UnimplementedClientServiceServer
 
 	mu sync.Mutex
 
@@ -71,6 +73,52 @@ func NewNode(id string, peers []string) *Node {
 // call this once, after registering the Node with a gRPC server
 func (n *Node) Start() {
 	go n.runElectionTimer()
+}
+
+// ErrNotLeader is returned by Propose when called on a non-leader node.
+var ErrNotLeader = errors.New("not the leader")
+
+// Propose appends command to the leader's log and blocks until it has been
+// committed and applied, or until the timeout elapses.
+func (n *Node) Propose(command string) error {
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		return ErrNotLeader
+	}
+	index := int64(len(n.log)) + 1
+	n.log = append(n.log, &pb.LogEntry{
+		Term:    n.currentTerm,
+		Index:   index,
+		Command: command,
+	})
+	n.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		n.mu.Lock()
+		applied := n.lastApplied >= index
+		stillLeader := n.state == Leader
+		n.mu.Unlock()
+
+		if applied {
+			return nil
+		}
+		if !stillLeader {
+			return errors.New("lost leadership before entry committed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return errors.New("timed out waiting for entry to commit")
+}
+
+// getLocal reads the current value for key from this node's local state
+// machine. Only reflects committed, applied writes on this specific node.
+func (n *Node) getLocal(key string) (string, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	v, ok := n.kv[key]
+	return v, ok
 }
 
 func (n *Node) runElectionTimer() {
@@ -174,6 +222,7 @@ func (n *Node) startElection() {
 // to maintain this node's leadership for the given term. It exits as soon
 // as this node is no longer the leader of that term.
 func (n *Node) runLeaderHeartbeats(term int64) {
+	// initialize nextIndex and matchIndex for all peers
 	n.mu.Lock()
 	n.nextIndex = make(map[string]int64)
 	n.matchIndex = make(map[string]int64)
@@ -415,4 +464,27 @@ func applyCommand(kv map[string]string, command string) {
 			delete(kv, parts[1])
 		}
 	}
+}
+
+// Put implements ClientServiceServer. Only succeeds on the current leader.
+func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutReply, error) {
+	if err := n.Propose("SET " + req.Key + " " + req.Value); err != nil {
+		return &pb.PutReply{Success: false, Error: err.Error()}, nil
+	}
+	return &pb.PutReply{Success: true}, nil
+}
+
+// Delete implements ClientServiceServer.
+func (n *Node) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.PutReply, error) {
+	if err := n.Propose("DELETE " + req.Key); err != nil {
+		return &pb.PutReply{Success: false, Error: err.Error()}, nil
+	}
+	return &pb.PutReply{Success: true}, nil
+}
+
+// Get implements ClientServiceServer. Reads local applied state directly -
+// only guaranteed fresh when called on the leader.
+func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetReply, error) {
+	value, found := n.getLocal(req.Key)
+	return &pb.GetReply{Found: found, Value: value}, nil
 }
