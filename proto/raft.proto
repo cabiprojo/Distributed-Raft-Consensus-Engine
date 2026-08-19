@@ -9,7 +9,8 @@ service RaftService {
   rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
 }
 
-// ClientService is what an external client talks to, to read/write the kv store.
+// ClientService is what an external client talks to
+// used to read/write the kv store
 service ClientService {
   rpc Put(PutRequest) returns (PutReply);
   rpc Delete(DeleteRequest) returns (PutReply);

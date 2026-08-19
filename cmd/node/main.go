@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -16,6 +17,7 @@ func main() {
 	id := flag.String("id", "", "unique id for this node (e.g. node1)")
 	port := flag.String("port", "", "port this node listens on (e.g. 50051)")
 	peers := flag.String("peers", "", "comma-separated host:port list of peer nodes")
+	dataDir := flag.String("datadir", ".", "directory to persist this node's state in")
 	flag.Parse()
 
 	if *id == "" || *port == "" {
@@ -27,6 +29,8 @@ func main() {
 		peerList = strings.Split(*peers, ",")
 	}
 
+	persistPath := filepath.Join(*dataDir, *id+"-state.json")
+
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
@@ -34,7 +38,7 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 
-	raftNode := raft.NewNode(*id, peerList)
+	raftNode := raft.NewNode(*id, peerList, persistPath)
 	pb.RegisterRaftServiceServer(grpcServer, raftNode)
 	pb.RegisterClientServiceServer(grpcServer, raftNode)
 	raftNode.Start()

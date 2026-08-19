@@ -2,9 +2,11 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +53,56 @@ type Node struct {
 
 	// the actual replicated state machine - applied to as entries commit
 	kv map[string]string
+
+	// where persistent state (currentTerm, votedFor, log) is durably saved
+	persistPath string
+}
+
+// persistedState is the on-disk representation of a Node's persistent state
+// everything that must survive a crash and restart
+type persistedState struct {
+	CurrentTerm int64
+	VotedFor    string
+	Log         []*pb.LogEntry
+}
+
+// persistLocked durably writes currentTerm/votedFor/log to disk
+// caller must hold n.mu
+// must be called BEFORE replying to any RPC that changed these fields
+// see the persist-before-reply safety rule
+func (n *Node) persistLocked() {
+	if n.persistPath == "" {
+		return
+	}
+	data, err := json.MarshalIndent(persistedState{
+		CurrentTerm: n.currentTerm,
+		VotedFor:    n.votedFor,
+		Log:         n.log,
+	}, "", "  ")
+	if err != nil {
+		log.Printf("[%s] failed to marshal persistent state: %v", n.id, err)
+		return
+	}
+	if err := os.WriteFile(n.persistPath, data, 0600); err != nil {
+		log.Printf("[%s] failed to persist state to %s: %v", n.id, n.persistPath, err)
+	}
+}
+
+// loadPersisted reads previously-saved state from disk, if any exists
+// returns the zero state (fresh node) if the file doesn't exist yet
+func loadPersisted(path string) (persistedState, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return persistedState{}, nil
+	}
+	if err != nil {
+		return persistedState{}, err
+	}
+	var ps persistedState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		return persistedState{}, err
+	}
+	return ps, nil
 }
 
 func randomElectionTimeout() time.Duration {
@@ -59,13 +111,24 @@ func randomElectionTimeout() time.Duration {
 
 // NewNode constructs a Node in the Follower state, ready to be started
 // peers is the list of other nodes' "host:port" addresses
-func NewNode(id string, peers []string) *Node {
+// persistPath is where currentTerm/votedFor/log are durably saved
+// pass "" to run in-memory only
+// if persistPath already has saved state, it's loaded here
+func NewNode(id string, peers []string, persistPath string) *Node {
+	ps, err := loadPersisted(persistPath)
+	if err != nil {
+		log.Printf("[%s] failed to load persisted state, starting fresh: %v", id, err)
+	}
 	return &Node{
 		id:            id,
 		state:         Follower,
 		peers:         peers,
 		lastHeartbeat: time.Now(),
 		kv:            make(map[string]string),
+		persistPath:   persistPath,
+		currentTerm:   ps.CurrentTerm,
+		votedFor:      ps.VotedFor,
+		log:           ps.Log,
 	}
 }
 
@@ -75,11 +138,11 @@ func (n *Node) Start() {
 	go n.runElectionTimer()
 }
 
-// ErrNotLeader is returned by Propose when called on a non-leader node.
+// ErrNotLeader is returned by Propose when called on a non-leader node
 var ErrNotLeader = errors.New("not the leader")
 
-// Propose appends command to the leader's log and blocks until it has been
-// committed and applied, or until the timeout elapses.
+// Propose appends command to the leader's log
+// blocks until the entry is committed and applied, or the timeout elapses
 func (n *Node) Propose(command string) error {
 	n.mu.Lock()
 	if n.state != Leader {
@@ -92,6 +155,7 @@ func (n *Node) Propose(command string) error {
 		Index:   index,
 		Command: command,
 	})
+	n.persistLocked()
 	n.mu.Unlock()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -112,8 +176,8 @@ func (n *Node) Propose(command string) error {
 	return errors.New("timed out waiting for entry to commit")
 }
 
-// getLocal reads the current value for key from this node's local state
-// machine. Only reflects committed, applied writes on this specific node.
+// getLocal reads the current value for key from this node's local state machine
+// only reflects committed, applied writes on this specific node
 func (n *Node) getLocal(key string) (string, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -152,6 +216,7 @@ func (n *Node) startElection() {
 	n.votedFor = n.id
 	n.state = Candidate
 	n.lastHeartbeat = time.Now()
+	n.persistLocked()
 
 	term := n.currentTerm
 	candidateID := n.id
@@ -219,8 +284,8 @@ func (n *Node) startElection() {
 }
 
 // runLeaderHeartbeats periodically sends empty AppendEntries to every peer
-// to maintain this node's leadership for the given term. It exits as soon
-// as this node is no longer the leader of that term.
+// to maintain this node's leadership for the given term
+// it exits as soon as this node is no longer the leader of that term
 func (n *Node) runLeaderHeartbeats(term int64) {
 	// initialize nextIndex and matchIndex for all peers
 	n.mu.Lock()
@@ -251,9 +316,9 @@ func (n *Node) runLeaderHeartbeats(term int64) {
 	}
 }
 
-// replicateToPeer sends one AppendEntries RPC to a single peer, containing
-// whatever entries that peer is missing according to nextIndex, then
-// updates nextIndex/matchIndex based on the result.
+// replicateToPeer sends one AppendEntries RPC to a single peer
+// containing whatever entries that peer is missing according to nextIndex
+// updates nextIndex/matchIndex based on the result
 func (n *Node) replicateToPeer(term int64, id string, peer string) {
 	n.mu.Lock()
 	if n.state != Leader || n.currentTerm != term {
@@ -316,11 +381,11 @@ func (n *Node) replicateToPeer(term int64, id string, peer string) {
 	}
 }
 
-// advanceCommitIndexLocked checks whether commitIndex can move forward.
+// advanceCommitIndexLocked checks whether commitIndex can move forward
 // Per the Figure 8 safety rule, an entry can only be committed by direct
-// majority count if it was created during the leader's own current term;
+// majority count if it was created during the leader's own current term
 // older entries become committed indirectly once a current-term entry
-// past them commits. Caller must hold n.mu.
+// past them commits. Caller must hold n.mu
 func (n *Node) advanceCommitIndexLocked(term int64) {
 	for N := int64(len(n.log)); N > n.commitIndex; N-- {
 		if n.log[N-1].Term != term {
@@ -354,11 +419,12 @@ func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.R
 	}
 
 	// a higher term means we're behind: adopt it and step down
-	// regardless of whether we end up granting this particular vote.
+	// regardless of whether we end up granting this particular vote
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.votedFor = ""
 		n.state = Follower
+		n.persistLocked()
 	}
 
 	// one vote per term
@@ -376,15 +442,14 @@ func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.R
 	if canVote && logUpToDate {
 		n.votedFor = args.CandidateId
 		n.lastHeartbeat = time.Now()
+		n.persistLocked()
 		return &pb.RequestVoteReply{Term: n.currentTerm, VoteGranted: true}, nil
 	}
 
 	return &pb.RequestVoteReply{Term: n.currentTerm, VoteGranted: false}, nil
 }
 
-// AppendEntries implements the RaftServiceServer interface. For now this
-// only handles the heartbeat case (empty entries) - log replication comes
-// in a later commit.
+// AppendEntries implements the RaftServiceServer interface
 func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*pb.AppendEntriesReply, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -398,6 +463,7 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.votedFor = ""
+		n.persistLocked()
 	}
 
 	// a candidate steps down on an EQUAL term too, not just a higher one
@@ -424,6 +490,7 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 			continue
 		}
 		n.log = append(n.log[:idx-1], args.Entries[i:]...)
+		n.persistLocked()
 		break
 	}
 
@@ -466,7 +533,7 @@ func applyCommand(kv map[string]string, command string) {
 	}
 }
 
-// Put implements ClientServiceServer. Only succeeds on the current leader.
+// Put implements ClientServiceServer. Only succeeds on the current leader
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutReply, error) {
 	if err := n.Propose("SET " + req.Key + " " + req.Value); err != nil {
 		return &pb.PutReply{Success: false, Error: err.Error()}, nil
@@ -474,7 +541,7 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutReply, error
 	return &pb.PutReply{Success: true}, nil
 }
 
-// Delete implements ClientServiceServer.
+// Delete implements ClientServiceServer
 func (n *Node) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.PutReply, error) {
 	if err := n.Propose("DELETE " + req.Key); err != nil {
 		return &pb.PutReply{Success: false, Error: err.Error()}, nil
@@ -482,8 +549,8 @@ func (n *Node) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.PutReply,
 	return &pb.PutReply{Success: true}, nil
 }
 
-// Get implements ClientServiceServer. Reads local applied state directly -
-// only guaranteed fresh when called on the leader.
+// Get implements ClientServiceServer
+// reads local applied state directly only guaranteed fresh when called on the leader
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetReply, error) {
 	value, found := n.getLocal(req.Key)
 	return &pb.GetReply{Found: found, Value: value}, nil
