@@ -1,61 +1,67 @@
-# raft-kv
+# Distributed Raft Consensus Engine
 
-A from-scratch implementation of the Raft consensus algorithm in Go, built
-into a replicated key-value store. Built as a learning project: every
-piece of the core logic (leader election, log replication, commit safety,
-crash recovery) is implemented and understood by hand, not generated.
+A from-scratch implementation of the Raft consensus algorithm in Go,
+built into a working replicated key-value store. It covers leader
+election, log replication, crash recovery, and the safety rules that keep
+data consistent across nodes even when one of them fails.
 
 ## Status
 
-Working end-to-end. A 3-5 node cluster elects and maintains a single
-leader, replicates `SET`/`GET`/`DELETE` operations to a majority before
-committing them, persists state to disk so nodes recover correctly across
-a crash/restart, and survives a leader failure mid-write with zero loss of
-any acknowledged write.
+It works end to end. Spin up 3 to 5 nodes and they'll elect one leader and
+keep it, replicate SET/GET/DELETE writes to a majority of nodes before
+counting them as done, save state to disk so a node comes back correctly
+after a crash, and survive losing the leader mid-write without losing any
+write that was already confirmed.
 
 ## What's implemented
 
-- **Leader election**: randomized election timeouts, term-based logical
-  clock, the full `RequestVote` vote-granting rules (term check,
-  one-vote-per-term, the log-up-to-date safety restriction).
-- **Log replication**: real `AppendEntries` replication using
-  `nextIndex`/`matchIndex` per follower, the `prevLogIndex`/`prevLogTerm`
-  consistency check with conflict-entry truncation, and `commitIndex`
-  advancement that respects the Figure 8 restriction (a leader may only
-  directly commit entries from its own current term).
-- **Persistence**: `currentTerm`, `votedFor`, and the log are written to
-  disk before replying to any RPC that changes them, so a crashed and
-  restarted node never double-votes or silently loses committed data.
-- **Client interface**: a `ClientService` gRPC (`Put`/`Get`/`Delete`) plus
-  a small CLI client (`cmd/client`) for driving reads/writes against any
-  node.
-- **Verified failure recovery**: a 3-node cluster was run with client
-  writes going through the leader, the leader process was killed
-  mid-sequence, the cluster re-elected a new leader, writes resumed, every
-  previously-acknowledged write was confirmed present and consistent on
-  the surviving nodes, and the killed node was restarted and confirmed to
-  rejoin and catch up correctly (via both its own persisted state and log
-  replication from the new leader).
+- **Leader election**: nodes use randomized timeouts so they don't all try
+  to become leader at once, plus a term counter that acts like a logical
+  clock. The vote-granting rules cover the important edge case too: a
+  candidate only gets votes if its log is at least as up to date as the
+  voter's, which is what guarantees a new leader never "forgets" data
+  that already made it to a majority of nodes.
+- **Log replication**: the leader tracks what each follower actually has
+  (`nextIndex`/`matchIndex`) and sends only what they're missing. There's
+  a consistency check that catches and fixes any follower whose log
+  diverged from the leader's. Committing an entry follows the trickiest
+  safety rule in Raft (Figure 8 in the paper): a leader can only directly
+  commit entries from its own current term, older entries ride along once
+  a newer one commits.
+- **Persistence**: a node writes its term, its vote, and its log to disk
+  before it ever replies to a request that changed them. That ordering
+  matters, it's what stops a node from voting twice in the same term if
+  it crashes and comes back up with amnesia.
+- **Client interface**: a small gRPC service (`Put`/`Get`/`Delete`) plus a
+  CLI (`cmd/client`) so you can actually read and write to the cluster
+  instead of just watching logs.
+- **Verified failure recovery**: I ran a real 3-node cluster, wrote some
+  keys through the leader, killed the leader process mid-run, and watched
+  the cluster elect a new one and keep going. Every write that had
+  already been confirmed was still there afterward, on every surviving
+  node. I also restarted the node I killed and confirmed it rejoined and
+  caught back up correctly.
 
-## What's deliberately out of scope
+## What I left out on purpose
 
-- **Snapshotting / log compaction**: the log grows unboundedly. Fine for
-  a demo/learning project, a production system would need this to bound
-  disk usage and rejoin time for long-lagging followers.
-- **Cluster membership changes**: the peer set is fixed at startup via
-  `-peers`, Raft's joint-consensus membership-change protocol isn't
-  implemented.
-- **Broader chaos testing**: dropped/delayed RPCs and network partitions
-  beyond a hard process kill weren't scripted. The one failure scenario
-  above (kill leader mid-write) was run rigorously, a full partition/delay
-  test matrix was scoped out for time.
-- **Linearizable reads**: `Get` reads a node's local applied state
-  directly. On the leader this is normally fresh, but it isn't proven
-  linearizable (no read-index/lease mechanism), a stale leader that
-  hasn't yet learned it's been deposed could theoretically serve a stale
+- **Snapshotting / log compaction**: the log just grows forever right now.
+  That's fine for a project like this, but a real production system would
+  need a way to compact it so disk usage and rejoin time don't blow up.
+- **Changing cluster membership on the fly**: the list of peers is fixed
+  when a node starts. Raft has a protocol for safely adding or removing
+  nodes while the cluster is running, I didn't build that.
+- **Deeper chaos testing**: I tested the main failure case you'd actually
+  care about (leader dies mid-write) thoroughly, but I didn't build
+  tooling to simulate things like dropped or delayed network messages, or
+  a real network partition. That's the natural next thing to add.
+- **Linearizable reads**: reads are served from whatever a node has
+  locally applied. That's usually fine on the leader, but it's not
+  formally guaranteed to always be fresh, a leader that just got replaced
+  but doesn't know it yet could theoretically hand back a stale
   read for a brief window.
-- **TLS between nodes**: internal RPCs use insecure gRPC credentials,
-  fine for localhost, not for a real deployment.
+- **TLS between nodes**: nodes talk to each other over plain, unencrypted
+  gRPC. That's fine on localhost for a demo, not something you'd want in
+  a real deployment.
 
 ## Setup (run these locally, e.g. in VS Code with Claude Code)
 
